@@ -381,6 +381,10 @@ class RegistrationForm(FlaskForm):
     )
 
 
+# Load registration codes requirement setting from environment variable
+require_invite_code = os.getenv("REGISTRATION_CODES_REQUIRED", "True") == "True"
+
+
 class ChangePasswordForm(FlaskForm):
     old_password = PasswordField("Old Password", validators=[DataRequired()])
     new_password = PasswordField(
@@ -467,19 +471,25 @@ def index():
 @limiter.limit("120 per minute")
 def register():
     form = RegistrationForm()
+    # Dynamically adjust form field based on invite code requirement
+    if not require_invite_code:
+        del form.invite_code  # Remove invite_code field if not required
 
     if form.validate_on_submit():
         username = form.username.data
         password = form.password.data
-        invite_code_input = form.invite_code.data
 
-        # Validate the invite code
-        invite_code = InviteCode.query.filter_by(code=invite_code_input).first()
-        if not invite_code or invite_code.expiration_date < datetime.utcnow():
-            flash("⛔️ Invalid or expired invite code.", "error")
-            return redirect(url_for("register"))
+        # Only process invite code if required
+        invite_code_input = form.invite_code.data if require_invite_code else None
 
-        # Check for existing primary_username instead of username
+        if require_invite_code:
+            # Validate the invite code
+            invite_code = InviteCode.query.filter_by(code=invite_code_input).first()
+            if not invite_code or invite_code.expiration_date < datetime.utcnow():
+                flash("⛔️ Invalid or expired invite code.", "error")
+                return redirect(url_for("register"))
+
+        # Check for existing username (assuming primary_username is the field to check against)
         if User.query.filter_by(primary_username=username).first():
             flash("💔 Username already taken.", "error")
             return redirect(url_for("register"))
@@ -490,13 +500,15 @@ def register():
 
         # Add user to the database
         db.session.add(new_user)
-        db.session.delete(invite_code)
         db.session.commit()
 
         flash("👍 Registration successful! Please log in.", "success")
         return redirect(url_for("login"))
 
-    return render_template("register.html", form=form)
+    # Pass the flag to template to conditionally render invite code field
+    return render_template(
+        "register.html", form=form, require_invite_code=require_invite_code
+    )
 
 
 @app.route("/enable-2fa", methods=["GET", "POST"])
@@ -689,43 +701,46 @@ def inbox(username):
         return redirect(url_for("login"))
 
     # Initialize variables
-    user = User.query.filter_by(primary_username=username).first()
-    secondary_users_dict = {}
+    current_user = User.query.get(session["user_id"])
+    requested_user = User.query.filter_by(primary_username=username).first()
 
-    if user:
-        # User is a primary user, so fetch all messages for the primary user
+    # Verify that the requested inbox belongs to the logged-in user
+    if requested_user and (
+        requested_user.id == session["user_id"] or session.get("is_admin", False)
+    ):
+        secondary_users_dict = {su.id: su for su in requested_user.secondary_users}
         messages = (
-            Message.query.filter_by(user_id=user.id).order_by(Message.id.desc()).all()
-        )
-
-        # Create a dictionary of secondary users for labeling purposes
-        secondary_users_dict = {su.id: su for su in user.secondary_users}
-
-        # Set the flag for secondary user to false since we are in the primary user's inbox
-        is_secondary = False
-
-    else:
-        # If not found, try to find a secondary user and its related messages
-        secondary_user = SecondaryUser.query.filter_by(username=username).first_or_404()
-        messages = (
-            Message.query.filter_by(secondary_user_id=secondary_user.id)
+            Message.query.filter_by(user_id=requested_user.id)
             .order_by(Message.id.desc())
             .all()
         )
-
-        # Since we are viewing a secondary user's inbox, set the flag to true
-        is_secondary = True
-
-        # The primary user should still be accessible for operations like sending messages
-        user = secondary_user.primary_user
+        is_secondary = False
+    else:
+        # Check if the requested inbox is a secondary user of the logged-in user (and not accessing another primary user's inbox)
+        secondary_user = SecondaryUser.query.filter_by(
+            username=username, user_id=session["user_id"]
+        ).first()
+        if secondary_user:
+            messages = (
+                Message.query.filter_by(secondary_user_id=secondary_user.id)
+                .order_by(Message.id.desc())
+                .all()
+            )
+            is_secondary = True
+            secondary_users_dict = (
+                {}
+            )  # Secondary users don't have their own secondary users
+        else:
+            flash("You are not authorized to view this inbox.")
+            return redirect(url_for("index"))
 
     return render_template(
         "inbox.html",
-        user=user,
+        user=current_user,  # Pass the current logged-in user
         secondary_user=secondary_user if is_secondary else None,
         messages=messages,
         is_secondary=is_secondary,
-        secondary_users=secondary_users_dict,  # Pass this dictionary to the template
+        secondary_users=secondary_users_dict,
     )
 
 
@@ -1479,8 +1494,8 @@ def create_checkout_session():
         origin_page = request.referrer or url_for("index")
         session["origin_page"] = origin_page
 
-        price_id = "price_1OhiU5LcBPqjxU07a4eKQHrO"  # Test
-        # price_id = "price_1OhhYFLcBPqjxU07u2wYbUcF"
+        # price_id = "price_1OhiU5LcBPqjxU07a4eKQHrO"  # Test
+        price_id = "price_1OhhYFLcBPqjxU07u2wYbUcF"
 
         checkout_session = stripe.checkout.Session.create(
             customer=user.stripe_customer_id,
