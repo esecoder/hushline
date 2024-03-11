@@ -31,6 +31,7 @@ python-gnupg
 qrcode
 requests
 SQLAlchemy
+stripe
 typing_extensions
 urllib3
 Werkzeug
